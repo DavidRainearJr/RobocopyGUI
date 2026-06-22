@@ -1,0 +1,14 @@
+# Local app data
+RobocopyGui.settings.json
+RobocopyGui.operations.json
+logs/
+*.log
+
+# PowerShell/editor noise
+*.ps1xml
+.vscode/
+.idea/
+
+# Windows noise
+Thumbs.db
+Desktop.ini
