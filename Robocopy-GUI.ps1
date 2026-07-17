@@ -38,6 +38,12 @@ $LogDirectory = Join-Path $ScriptDirectory 'logs'
 
 $script:CurrentProcess = $null
 $script:CurrentLogFile = $null
+$script:LogPollTimer = $null
+$script:LogReadOffset = [int64]0
+$script:RunWasCancelled = $false
+$script:RunCompletionHandled = $false
+$script:LastProgressPercent = -1
+$script:MaxOutputCharacters = 120000
 
 $script:AdditionalOptionCatalog = @(
     [pscustomobject]@{
@@ -542,22 +548,151 @@ function Test-SourceDestructiveOperation {
     return Test-AdvancedArgumentSwitch @('MOVE', 'MOV')
 }
 
-function Add-OutputLine {
-    param([string]$Line)
+function Limit-OutputText {
+    if ($null -eq $txtOutput -or $txtOutput.IsDisposed) {
+        return
+    }
+
+    if ($txtOutput.TextLength -le $script:MaxOutputCharacters) {
+        return
+    }
+
+    $text = $txtOutput.Text
+    $removeCount = $text.Length - $script:MaxOutputCharacters
+    $startIndex = $removeCount
+    $newlineIndex = $text.IndexOf([Environment]::NewLine, $removeCount)
+
+    if ($newlineIndex -ge 0 -and $newlineIndex -lt ($removeCount + 5000)) {
+        $startIndex = $newlineIndex + [Environment]::NewLine.Length
+    }
+
+    $txtOutput.Text = "[older output trimmed]$([Environment]::NewLine)$($text.Substring($startIndex))"
+    $txtOutput.SelectionStart = $txtOutput.TextLength
+    $txtOutput.ScrollToCaret()
+}
+
+function Add-OutputText {
+    param([string]$Text)
 
     if ($null -eq $txtOutput) {
         return
     }
 
-    if ($txtOutput.InvokeRequired) {
-        $action = [System.Action[string]]{ param($value) Add-OutputLine $value }
-        [void]$txtOutput.BeginInvoke($action, $Line)
+    if ([string]::IsNullOrEmpty($Text) -or $txtOutput.IsDisposed -or $txtOutput.InvokeRequired) {
         return
     }
 
-    $txtOutput.AppendText($Line + [Environment]::NewLine)
+    $normalizedText = $Text.Replace("`r`n", "`n").Replace("`r", "`n").Replace("`n", [Environment]::NewLine)
+    $txtOutput.AppendText($normalizedText)
+    Limit-OutputText
     $txtOutput.SelectionStart = $txtOutput.TextLength
     $txtOutput.ScrollToCaret()
+}
+
+function Add-OutputLine {
+    param([string]$Line)
+
+    Add-OutputText ($Line + [Environment]::NewLine)
+}
+
+function Set-RobocopyProgressStatus {
+    param(
+        [string]$Status,
+        [int]$Percent = -1,
+        [bool]$UseMarquee = $false
+    )
+
+    if ($null -eq $prgRobocopy -or $prgRobocopy.IsDisposed) {
+        return
+    }
+
+    if ($UseMarquee) {
+        $prgRobocopy.Style = [System.Windows.Forms.ProgressBarStyle]::Marquee
+        $prgRobocopy.MarqueeAnimationSpeed = 30
+        $prgRobocopy.Value = 0
+    } else {
+        $prgRobocopy.Style = [System.Windows.Forms.ProgressBarStyle]::Continuous
+        $prgRobocopy.MarqueeAnimationSpeed = 0
+
+        if ($Percent -ge 0) {
+            $boundedPercent = [Math]::Max(0, [Math]::Min(100, $Percent))
+            $prgRobocopy.Value = $boundedPercent
+        } else {
+            $prgRobocopy.Value = 0
+        }
+    }
+
+    if ($null -ne $lblProgress -and -not $lblProgress.IsDisposed) {
+        if ($Percent -ge 0) {
+            $lblProgress.Text = "${Status}: $([Math]::Max(0, [Math]::Min(100, $Percent)))%"
+        } else {
+            $lblProgress.Text = $Status
+        }
+    }
+}
+
+function Update-RobocopyProgressFromText {
+    param([string]$Text)
+
+    if ([string]::IsNullOrEmpty($Text)) {
+        return
+    }
+
+    foreach ($match in [regex]::Matches($Text, '(?<!\d)(100(?:\.0)?|[1-9]?\d(?:\.\d)?)\s*%')) {
+        $percentValue = [double]::Parse($match.Groups[1].Value, [System.Globalization.CultureInfo]::InvariantCulture)
+        $percent = [int][Math]::Round($percentValue)
+
+        if ($percent -ne $script:LastProgressPercent) {
+            $script:LastProgressPercent = $percent
+            Set-RobocopyProgressStatus -Status 'Current file progress' -Percent $percent
+        }
+    }
+}
+
+function Read-RobocopyLogUpdates {
+    if ([string]::IsNullOrWhiteSpace($script:CurrentLogFile) -or -not (Test-Path -LiteralPath $script:CurrentLogFile -PathType Leaf)) {
+        return
+    }
+
+    $stream = $null
+    $reader = $null
+
+    try {
+        $stream = [System.IO.File]::Open($script:CurrentLogFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+
+        if ($script:LogReadOffset -gt $stream.Length) {
+            $script:LogReadOffset = [int64]0
+        }
+
+        [void]$stream.Seek($script:LogReadOffset, [System.IO.SeekOrigin]::Begin)
+        $reader = New-Object -TypeName System.IO.StreamReader -ArgumentList @($stream, [System.Text.Encoding]::Default, $true)
+        $text = $reader.ReadToEnd()
+        $script:LogReadOffset = $stream.Position
+    } catch {
+        return
+    } finally {
+        if ($reader) {
+            $reader.Dispose()
+        } elseif ($stream) {
+            $stream.Dispose()
+        }
+    }
+
+    if (-not [string]::IsNullOrEmpty($text)) {
+        Update-RobocopyProgressFromText $text
+        Add-OutputText $text
+    }
+}
+
+function Poll-RobocopyRun {
+    Read-RobocopyLogUpdates
+
+    if ($script:CurrentProcess -and $script:CurrentProcess.HasExited -and -not $script:RunCompletionHandled) {
+        $script:RunCompletionHandled = $true
+        $exitCode = $script:CurrentProcess.ExitCode
+        Read-RobocopyLogUpdates
+        Complete-RobocopyRun $exitCode
+    }
 }
 
 function Set-RunState {
@@ -575,10 +710,33 @@ function Set-RunState {
 function Complete-RobocopyRun {
     param([int]$ExitCode)
 
-    if ($ExitCode -le 7) {
+    if ($script:LogPollTimer) {
+        $script:LogPollTimer.Stop()
+    }
+
+    Read-RobocopyLogUpdates
+
+    if ($script:RunWasCancelled) {
+        Add-OutputLine "Robocopy was cancelled. Exit code: $ExitCode"
+        if ($script:LastProgressPercent -ge 0) {
+            Set-RobocopyProgressStatus -Status 'Cancelled. Last file progress' -Percent $script:LastProgressPercent
+        } else {
+            Set-RobocopyProgressStatus -Status 'Cancelled'
+        }
+    } elseif ($ExitCode -le 7) {
         Add-OutputLine "Robocopy completed successfully. Exit code: $ExitCode"
+        if ($script:LastProgressPercent -ge 0) {
+            Set-RobocopyProgressStatus -Status 'Completed' -Percent 100
+        } else {
+            Set-RobocopyProgressStatus -Status 'Completed'
+        }
     } else {
         Add-OutputLine "Robocopy failed. Exit code: $ExitCode"
+        if ($script:LastProgressPercent -ge 0) {
+            Set-RobocopyProgressStatus -Status "Failed. Last file progress" -Percent $script:LastProgressPercent
+        } else {
+            Set-RobocopyProgressStatus -Status "Failed. Exit code $ExitCode"
+        }
     }
 
     if ($script:CurrentLogFile) {
@@ -641,38 +799,41 @@ function Start-RobocopyRun {
     $processInfo.FileName = 'robocopy.exe'
     $processInfo.Arguments = $argumentText
     $processInfo.UseShellExecute = $false
-    $processInfo.RedirectStandardOutput = $true
-    $processInfo.RedirectStandardError = $true
+    $processInfo.RedirectStandardOutput = $false
+    $processInfo.RedirectStandardError = $false
     $processInfo.CreateNoWindow = $true
 
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $processInfo
-    $process.EnableRaisingEvents = $true
-
-    $outputHandler = [System.Diagnostics.DataReceivedEventHandler]{
-        param($sender, $eventArgs)
-        if (-not [string]::IsNullOrEmpty($eventArgs.Data)) {
-            Add-OutputLine $eventArgs.Data
-        }
-    }
-
-    $process.add_OutputDataReceived($outputHandler)
-    $process.add_ErrorDataReceived($outputHandler)
-    $process.add_Exited({
-        param($sender, $eventArgs)
-        $script:LastRobocopyExitCode = $sender.ExitCode
-        [void]$form.BeginInvoke([System.Action]{ Complete-RobocopyRun $script:LastRobocopyExitCode })
-    })
+    $process.EnableRaisingEvents = $false
 
     try {
+        $script:LogReadOffset = [int64]0
+        $script:RunWasCancelled = $false
+        $script:RunCompletionHandled = $false
+        $script:LastProgressPercent = -1
+
         Set-RunState $true
+        if ($chkNoProgress.Checked) {
+            Set-RobocopyProgressStatus -Status 'Running. Progress hidden by /NP' -UseMarquee:$true
+        } else {
+            Set-RobocopyProgressStatus -Status 'Starting. Waiting for progress'
+        }
+
         $script:CurrentProcess = $process
         [void]$process.Start()
-        $process.BeginOutputReadLine()
-        $process.BeginErrorReadLine()
+        if ($script:LogPollTimer) {
+            $script:LogPollTimer.Start()
+        }
     } catch {
+        if ($script:LogPollTimer) {
+            $script:LogPollTimer.Stop()
+        }
+
         Set-RunState $false
         $script:CurrentProcess = $null
+        Set-RobocopyProgressStatus -Status 'Could not start robocopy'
+        $process.Dispose()
         Show-ErrorMessage "Could not start robocopy.`r`n`r`n$($_.Exception.Message)"
     }
 }
@@ -1083,7 +1244,7 @@ $chkNoProgress = New-Object System.Windows.Forms.CheckBox
 $chkNoProgress.Text = 'No progress (/NP)'
 $chkNoProgress.Location = New-Object System.Drawing.Point(240, 60)
 $chkNoProgress.Size = New-Object System.Drawing.Size(140, 24)
-$chkNoProgress.Checked = $true
+$chkNoProgress.Checked = $false
 $grpCommon.Controls.Add($chkNoProgress)
 
 $chkTee = New-Object System.Windows.Forms.CheckBox
@@ -1213,9 +1374,24 @@ $grpOutput.Location = New-Object System.Drawing.Point(10, 645)
 $grpOutput.Size = New-Object System.Drawing.Size(1045, 140)
 $form.Controls.Add($grpOutput)
 
+$lblProgress = New-Object System.Windows.Forms.Label
+$lblProgress.Text = 'Progress: idle'
+$lblProgress.Location = New-Object System.Drawing.Point(15, 26)
+$lblProgress.Size = New-Object System.Drawing.Size(220, 20)
+$grpOutput.Controls.Add($lblProgress)
+
+$prgRobocopy = New-Object System.Windows.Forms.ProgressBar
+$prgRobocopy.Location = New-Object System.Drawing.Point(245, 24)
+$prgRobocopy.Size = New-Object System.Drawing.Size(775, 22)
+$prgRobocopy.Minimum = 0
+$prgRobocopy.Maximum = 100
+$prgRobocopy.Value = 0
+$prgRobocopy.Style = [System.Windows.Forms.ProgressBarStyle]::Continuous
+$grpOutput.Controls.Add($prgRobocopy)
+
 $txtOutput = New-Object System.Windows.Forms.TextBox
-$txtOutput.Location = New-Object System.Drawing.Point(15, 25)
-$txtOutput.Size = New-Object System.Drawing.Size(1005, 100)
+$txtOutput.Location = New-Object System.Drawing.Point(15, 55)
+$txtOutput.Size = New-Object System.Drawing.Size(1005, 70)
 $txtOutput.Multiline = $true
 $txtOutput.ReadOnly = $true
 $txtOutput.ScrollBars = 'Vertical'
@@ -1289,8 +1465,8 @@ $toolTip.SetToolTip($chkExcludeJunctions, 'Adds /XJ. Avoids following junction p
 $toolTip.SetToolTip($chkRestartable, 'Adds /Z. Allows interrupted file copies to restart, at some performance cost.')
 $toolTip.SetToolTip($chkMultiThread, 'Adds /MT:n. Copies with multiple threads. Higher values can improve speed but increase disk and network load.')
 $toolTip.SetToolTip($numThreads, 'Thread count for /MT. Robocopy allows values from 1 to 128.')
-$toolTip.SetToolTip($chkNoProgress, 'Adds /NP. Hides percentage progress, which keeps logs smaller and cleaner.')
-$toolTip.SetToolTip($chkTee, 'Adds /TEE. Writes robocopy output to both the GUI output stream and the log file.')
+$toolTip.SetToolTip($chkNoProgress, 'Adds /NP. Hides percentage progress and disables percentage updates in the GUI.')
+$toolTip.SetToolTip($chkTee, 'Adds /TEE. Robocopy also writes to a console if available; the GUI reads live output from the log file.')
 $toolTip.SetToolTip($numRetries, 'Retry count for failed copies. This script defaults to 3 instead of robocopy default 1,000,000.')
 $toolTip.SetToolTip($numWait, 'Seconds to wait between retries. This script defaults to 10 instead of robocopy default 30.')
 $toolTip.SetToolTip($cmbAdditional, $cmbAdditional.SelectedItem.Description)
@@ -1301,6 +1477,8 @@ $toolTip.SetToolTip($txtExcludeFiles, 'Optional /XF patterns separated by commas
 $toolTip.SetToolTip($txtExcludeFolders, 'Optional /XD folder names or paths separated by commas, semicolons, or new lines. Example: node_modules; .git')
 $toolTip.SetToolTip($txtAdvanced, 'Raw robocopy switches appended after generated options. Advanced options can override earlier generated switches.')
 $toolTip.SetToolTip($txtCommandPreview, 'Generated command preview. Advanced arguments are appended at the end.')
+$toolTip.SetToolTip($lblProgress, 'Shows robocopy current-file progress when /NP is not used. Robocopy does not expose total job progress.')
+$toolTip.SetToolTip($prgRobocopy, 'Shows robocopy current-file progress when /NP is not used. Robocopy does not expose total job progress.')
 $toolTip.SetToolTip($btnSaveSettings, 'Saves option choices only. Folder paths are not saved here.')
 $toolTip.SetToolTip($btnLoadSettings, 'Loads option choices from RobocopyGui.settings.json.')
 $toolTip.SetToolTip($btnSaveOperation, 'Saves source, destination, mode, options, and advanced arguments as a named operation.')
@@ -1311,6 +1489,10 @@ $toolTip.SetToolTip($btnRun, 'Runs the generated robocopy command.')
 $toolTip.SetToolTip($btnCancel, 'Stops the running robocopy process.')
 $toolTip.SetToolTip($btnClose, 'Closes the GUI.')
 
+$script:LogPollTimer = New-Object System.Windows.Forms.Timer
+$script:LogPollTimer.Interval = 500
+$script:LogPollTimer.Add_Tick({ Poll-RobocopyRun })
+
 $btnBrowseSource.Add_Click({ Select-FolderForTextBox $txtSource })
 $btnBrowseDestination.Add_Click({ Select-FolderForTextBox $txtDestination })
 $btnAddAdditional.Add_Click({ Add-AdditionalOption $cmbAdditional.SelectedItem; Update-CommandPreview })
@@ -1319,8 +1501,15 @@ $btnPreview.Add_Click({ Start-RobocopyRun -ForcePreview:$true })
 $btnRun.Add_Click({ Start-RobocopyRun -ForcePreview:$false })
 $btnCancel.Add_Click({
     if ($script:CurrentProcess -and -not $script:CurrentProcess.HasExited) {
-        $script:CurrentProcess.Kill()
-        Add-OutputLine 'Cancel requested. Robocopy process was terminated.'
+        $script:RunWasCancelled = $true
+        Set-RobocopyProgressStatus -Status 'Cancelling robocopy'
+
+        try {
+            $script:CurrentProcess.Kill()
+            Add-OutputLine 'Cancel requested. Robocopy process was terminated.'
+        } catch {
+            Add-OutputLine "Cancel failed: $($_.Exception.Message)"
+        }
     }
 })
 $btnSaveSettings.Add_Click({ Save-SettingsFile })
@@ -1377,8 +1566,25 @@ $form.Add_FormClosing({
         if ($cancel) {
             $eventArgs.Cancel = $true
         } else {
-            $script:CurrentProcess.Kill()
+            $script:RunWasCancelled = $true
+            try {
+                $script:CurrentProcess.Kill()
+            } catch {
+            }
         }
+    }
+})
+
+$form.Add_FormClosed({
+    if ($script:LogPollTimer) {
+        $script:LogPollTimer.Stop()
+        $script:LogPollTimer.Dispose()
+        $script:LogPollTimer = $null
+    }
+
+    if ($script:CurrentProcess) {
+        $script:CurrentProcess.Dispose()
+        $script:CurrentProcess = $null
     }
 })
 

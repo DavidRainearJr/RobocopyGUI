@@ -13,6 +13,7 @@ A small Windows GUI for building and running common `robocopy` operations withou
 - Save option settings.
 - Save named operations with folder locations and settings.
 - Write timestamped logs.
+- Show live robocopy output and current-file percentage progress.
 - Show hover tooltips for controls after a short delay.
 
 ## Requirements
